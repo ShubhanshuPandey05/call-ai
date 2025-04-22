@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Phone Call Simulator</title>
+</head>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        background-color: #f5f5f5;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+    }
+
+    .container {
+        max-width: 400px;
+        width: 100%;
+        padding: 20px;
+        background-color: white;
+        border-radius: 20px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+        text-align: center;
+    }
+
+    h1 {
+        color: #333;
+        margin-bottom: 30px;
+    }
+
+    .status-container {
+        margin: 20px 0;
+        padding: 15px;
+        background-color: #f9f9f9;
+        border-radius: 15px;
+        font-size: 18px;
+    }
+
+    .controls {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 15px;
+    }
+
+    .btn {
+        padding: 12px 20px;
+        border: none;
+        border-radius: 10px;
+        cursor: pointer;
+        font-size: 16px;
+        transition: all 0.3s ease;
+        width: 100%;
+        max-width: 200px;
+    }
+
+    #startBtn {
+        background-color: #4CAF50;
+        color: white;
+    }
+
+    #endBtn {
+        background-color: #607D8B;
+        color: white;
+    }
+
+    .btn:disabled {
+        background-color: #cccccc;
+        cursor: not-allowed;
+    }
+    
+    .microphone-animation {
+        position: relative;
+        width: 120px;
+        height: 120px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 20px auto;
+    }
+    
+    .mic-icon {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background-color: #2196F3;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        color: white;
+        font-size: 30px;
+    }
+    
+    .mic-icon.active {
+        background-color: #f44336;
+    }
+    
+    .pulse {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        background-color: rgba(33, 150, 243, 0.3);
+        opacity: 0;
+    }
+    
+    .pulse.active {
+        animation: pulse 1.5s infinite ease-in-out;
+    }
+    
+    @keyframes pulse {
+        0% {
+            transform: scale(0.5);
+            opacity: 0;
+        }
+        50% {
+            opacity: 0.3;
+        }
+        100% {
+            transform: scale(1.2);
+            opacity: 0;
+        }
+    }
+
+    .debug-panel {
+        margin-top: 20px;
+        padding: 10px;
+        background-color: #f5f5f5;
+        border-radius: 5px;
+        font-size: 12px;
+        text-align: left;
+    }
+    
+    .volume-meter {
+        width: 100%;
+        height: 10px;
+        background-color: #eee;
+        border-radius: 5px;
+        margin-top: 10px;
+        overflow: hidden;
+    }
+    
+    .volume-level {
+        height: 100%;
+        background-color: #2196F3;
+        width: 0%;
+        transition: width 0.1s;
+    }
+</style>
+
+<body>
+    <div class="container">
+        <h1>AI Voice Call</h1>
+
+        <div class="status-container">
+            <span id="status">Ready to start</span>
+            <div class="volume-meter">
+                <div id="volumeLevel" class="volume-level"></div>
+            </div>
+        </div>
+
+        <div class="microphone-animation">
+            <div class="pulse" id="micPulse"></div>
+            <div class="mic-icon" id="micIcon">
+                <i>🎤</i>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="startBtn" class="btn">Start Call</button>
+            <button id="endBtn" class="btn" disabled>End Call</button>
+        </div>
+
+        <div class="debug-panel" id="debugPanel">Debug info will appear here...</div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // DOM Elements
+            const startBtn = document.getElementById('startBtn');
+            const endBtn = document.getElementById('endBtn');
+            const status = document.getElementById('status');
+            const micPulse = document.getElementById('micPulse');
+            const micIcon = document.getElementById('micIcon');
+            const debugPanel = document.getElementById('debugPanel');
+            const volumeLevel = document.getElementById('volumeLevel');
+
+            // Debug function
+            function debug(message) {
+                console.log(message);
+                debugPanel.innerHTML += `<div>${message}</div>`;
+                const lines = debugPanel.getElementsByTagName('div');
+                if (lines.length > 5) {
+                    debugPanel.removeChild(lines[0]);
+                }
+            }
+            const socket = io();
+
+            let mediaRecorder;
+            let audioChunks = [];
+            let isRecording = false;
+            let audioContext;
+            let audioPlayer = new Audio();
+            let isAIResponding = false;
+            let stream = null;
+            let audioAnalyser = null;
+            let speechDetectionInterval = null;
+            let silenceTimeout = null;
+            
+            // Voice activity detection settings
+            const VAD_SETTINGS = {
+                threshold: 45,            // Volume threshold 15 to detect speech
+                silenceDelay: 1000,       // Milliseconds of silence before considering speech ended
+                minSpeechLength: 300,     // Minimum speech length to trigger processing (ms)
+                checkInterval: 100,       // How often to check audio levels (ms)
+                speakingClass: 'active'   // CSS class to add when speaking
+            };
+
+            socket.on('connect', () => {
+                updateStatus('Connected to server');
+                debug('Socket connected');
+            });
+
+            socket.on('session_started', () => {
+                updateStatus('Call active - Microphone is on');
+                startBtn.disabled = true;
+                endBtn.disabled = false;
+                startVoiceDetection();
+                debug('Session started, activating voice detection');
+            });
+
+            socket.on('audio_response', (data) => {
+                isAIResponding = true;
+                debug('Received AI response');
+                if (data.audio) {
+                    playAudio(data.audio);
+                } else if (data.text) {
+                    debug(`AI: "${data.text.substring(0, 30)}..."`);
+                    speakText(data.text);
+                }
+            });
+
+            socket.on('error', (data) => {
+                updateStatus(`Error: ${data.message}`);
+                debug(`Error: ${data.message}`);
+                console.error('Error:', data.message);
+            });
+
+            socket.on('session_ended', () => {
+                updateStatus('Call ended');
+                debug('Session ended');
+                resetUI();
+            });
+
+            socket.on('disconnect', () => {
+                updateStatus('Disconnected from server');
+                debug('Socket disconnected');
+                resetUI();
+            });
+
+            startBtn.addEventListener('click', startSession);
+            endBtn.addEventListener('click', endSession);
+
+            function startSession() {
+                updateStatus('Starting call...');
+                debug('Starting session');
+                socket.emit('start_session');
+            }
+
+            async function startVoiceDetection() {
+                try {
+                    debug('Requesting microphone access');
+                    
+                    stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    });
+                    
+                    debug('Microphone access granted');
+                    
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const microphone = audioContext.createMediaStreamSource(stream);
+                    audioAnalyser = audioContext.createAnalyser();
+                    audioAnalyser.fftSize = 256;
+                    audioAnalyser.smoothingTimeConstant = 0.8;
+                    microphone.connect(audioAnalyser);
+                    
+                    const bufferLength = audioAnalyser.frequencyBinCount;
+                    const dataArray = new Uint8Array(bufferLength);
+                    
+                    let speaking = false;
+                    let speechStartTime = 0;
+                    
+                    speechDetectionInterval = setInterval(() => {
+                        if (!stream || !audioAnalyser) return;
+                        
+                        audioAnalyser.getByteFrequencyData(dataArray);
+
+                        let sum = 0;
+                        for (let i = 0; i < bufferLength; i++) {
+                            sum += dataArray[i];
+                        }
+                        const average = sum / bufferLength;
+
+                        updateVolumeMeter(average);
+                        if (average > VAD_SETTINGS.threshold) {
+                            if (!speaking) {
+                                speaking = true;
+                                speechStartTime = Date.now();
+                                handleSpeechStart();
+                            }
+                            
+                            if (silenceTimeout) {
+                                clearTimeout(silenceTimeout);
+                                silenceTimeout = null;
+                            }
+                            
+                        } else if (speaking) {
+                            // Possible end of speech, set timeout to confirm
+                            if (!silenceTimeout) {
+                                silenceTimeout = setTimeout(() => {
+                                    const speechDuration = Date.now() - speechStartTime;
+                                    if (speechDuration > VAD_SETTINGS.minSpeechLength) {
+                                        handleSpeechEnd();
+                                    } else {
+                                        debug(`Speech too short (${speechDuration}ms), ignoring`);
+                                    }
+                                    
+                                    speaking = false;
+                                    silenceTimeout = null;
+                                }, VAD_SETTINGS.silenceDelay);
+                            }
+                        }
+                        
+                    }, VAD_SETTINGS.checkInterval);
+                    
+                    // Update UI
+                    micIcon.classList.add('active');
+                    updateStatus('Microphone is on - Speak anytime');
+
+                } catch (error) {
+                    console.error('Error accessing microphone:', error);
+                    debug(`Microphone error: ${error.message}`);
+                    updateStatus('Error accessing microphone.');
+                }
+            }
+            
+            function updateVolumeMeter(level) {
+                const normalizedLevel = Math.min(100, Math.max(0, level * 4)); // Scale for better visibility
+                volumeLevel.style.width = `${normalizedLevel}%`;
+                
+                // Change color based on volume
+                if (normalizedLevel > 60) {
+                    volumeLevel.style.backgroundColor = '#f44336'; // High volume - red
+                } else if (normalizedLevel > 30) {
+                    volumeLevel.style.backgroundColor = '#ff9800'; // Medium volume - orange
+                } else {
+                    volumeLevel.style.backgroundColor = '#2196F3'; // Low volume - blue
+                }
+            }
+            
+            function handleSpeechStart() {
+                debug('Speech detected, starting recording');
+                
+                if (isAIResponding) {
+                    if (window.speechSynthesis && window.speechSynthesis.speaking) {
+                        window.speechSynthesis.cancel();
+                    }
+                    if (!audioPlayer.paused) {
+                        audioPlayer.pause();
+                        audioPlayer.currentTime = 0;
+                    }
+                    isAIResponding = false;
+                    debug('Stopped AI response for new user input');
+                }
+                
+                startRecording();
+                
+                micPulse.classList.add(VAD_SETTINGS.speakingClass);
+                updateStatus('You are speaking...');
+            }
+            
+            function handleSpeechEnd() {
+                debug('Speech ended, processing recording');
+                
+                stopRecording();
+                
+                micPulse.classList.remove(VAD_SETTINGS.speakingClass);
+                updateStatus('Processing what you said...');
+            }
+            
+            function startRecording() {
+                if (isRecording) {
+                    debug('Already recording, resetting');
+                    audioChunks = [];
+                    return;
+                }
+                
+                try {
+                    mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm;codecs=opus',
+                        audioBitsPerSecond: 128000
+                    });
+                    
+                    audioChunks = [];
+                    
+                    mediaRecorder.addEventListener('dataavailable', event => {
+                        if (event.data.size > 0) {
+                            audioChunks.push(event.data);
+                        }
+                    });
+                    
+                    mediaRecorder.addEventListener('stop', processRecording);
+                    
+                    // Start recording
+                    mediaRecorder.start(100); // Collect data every 100ms for smoother recording
+                    isRecording = true;
+                    
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    debug(`Recording error: ${error.message}`);
+                }
+            }
+            
+            function stopRecording() {
+                if (!isRecording || !mediaRecorder) {
+                    debug('Not recording, nothing to stop');
+                    return;
+                }
+                
+                try {
+                    mediaRecorder.stop();
+                    isRecording = false;
+                } catch (error) {
+                    console.error('Error stopping recording:', error);
+                    debug(`Stop recording error: ${error.message}`);
+                }
+            }
+
+            async function processRecording() {
+                try {
+                    // Create blob from audio chunks
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
+                    debug(`Processing audio blob: ${Math.round(audioBlob.size/1024)} KB`);
+
+                    // Skip if the recording is too short
+                    if (audioBlob.size < 1000) {
+                        debug('Recording too short, skipping');
+                        updateStatus('Microphone is on - Speak anytime');
+                        return;
+                    }
+
+                    const reader = new FileReader();
+                    reader.readAsDataURL(audioBlob);
+
+                    reader.onloadend = () => {
+                        const base64Audio = reader.result.split(',')[1];
+                        debug(`Sending audio to server: ${base64Audio.substring(0, 20)}...`);
+
+                        // Send audio to server
+                        socket.emit('send_audio', base64Audio);
+                        updateStatus('Waiting for response...');
+                    };
+
+                } catch (error) {
+                    console.error('Error processing recording:', error);
+                    debug(`Processing error: ${error.message}`);
+                    updateStatus('Error processing recording');
+                }
+            }
+
+            function playAudio(base64Audio) {
+                try {
+                    const audioSource = `data:audio/mp3;base64,${base64Audio}`;
+
+                    // Play audio
+                    audioPlayer.src = audioSource;
+                    audioPlayer.play();
+
+                    updateStatus('AI is speaking...');
+
+                    audioPlayer.onended = () => {
+                        isAIResponding = false;
+                        updateStatus('Microphone is on - Speak anytime');
+                    };
+                } catch (error) {
+                    console.error('Error playing audio:', error);
+                    debug(`Playback error: ${error.message}`);
+                    updateStatus('Error playing audio response');
+                    isAIResponding = false;
+                }
+            }
+
+            function speakText(text) {
+                if ('speechSynthesis' in window) {
+                    const utterance = new SpeechSynthesisUtterance(text);
+                    speechSynthesis.speak(utterance);
+
+                    updateStatus('AI is speaking...');
+
+                    utterance.onend = () => {
+                        isAIResponding = false;
+                        updateStatus('Microphone is on - Speak anytime');
+                    };
+                } else {
+                    console.warn('Text-to-speech not supported in this browser');
+                    debug('Text-to-speech not supported');
+                    isAIResponding = false;
+                }
+            }
+
+            function endSession() {
+                debug('Ending session');
+                socket.emit('end_session');
+                resetUI();
+            }
+
+            function resetUI() {
+                startBtn.disabled = false;
+                endBtn.disabled = true;
+                micIcon.classList.remove('active');
+                micPulse.classList.remove('active');
+                isAIResponding = false;
+                
+                if (speechDetectionInterval) {
+                    clearInterval(speechDetectionInterval);
+                    speechDetectionInterval = null;
+                }
+                
+                if (silenceTimeout) {
+                    clearTimeout(silenceTimeout);
+                    silenceTimeout = null;
+                }
+                
+                if (mediaRecorder && isRecording) {
+                    try {
+                        mediaRecorder.stop();
+                    } catch (e) {
+                    }
+                    isRecording = false;
+                }
+                
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                    stream = null;
+                }
+                
+                // Close audio context
+                if (audioContext && audioContext.state !== 'closed') {
+                    audioContext.close().catch(e => console.error('Error closing audio context:', e));
+                }
+                
+                audioAnalyser = null;
+                
+                if (window.speechSynthesis && window.speechSynthesis.speaking) {
+                    window.speechSynthesis.cancel();
+                }
+                
+                if (!audioPlayer.paused) {
+                    audioPlayer.pause();
+                    audioPlayer.currentTime = 0;
+                }
+                
+                volumeLevel.style.width = '0%';
+                
+                debug('UI reset complete');
+            }
+
+            function updateStatus(message) {
+                status.textContent = message;
+            }
+        });
+    </script>
+</body>
+
+</html>
